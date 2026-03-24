@@ -3,7 +3,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
-#include <unordered_set>
+#include <functional>
 #include <cstring>
 #include <sys/stat.h>
 
@@ -12,26 +12,84 @@ using namespace std;
 class FileStorage {
 private:
     string storage_dir;
+    static const int NUM_FILES = 10;
 
-    // Create a safe filename from the index
-    string get_filename(const string& index) {
-        string filename = storage_dir + "/";
-        for (char c : index) {
-            if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
-                c == '"' || c == '<' || c == '>' || c == '|') {
-                filename += '_';
-            } else {
-                filename += c;
-            }
-        }
-        filename += ".dat";
-        return filename;
+    // Hash function to determine which file to use
+    int get_file_index(const string& index) {
+        hash<string> hasher;
+        size_t hash_value = hasher(index);
+        return hash_value % NUM_FILES;
     }
 
-    // Check if file exists
-    bool file_exists(const string& filename) {
-        struct stat buffer;
-        return (stat(filename.c_str(), &buffer) == 0);
+    // Get filename for a given file index
+    string get_filename(int file_index) {
+        return storage_dir + "/storage_" + to_string(file_index) + ".dat";
+    }
+
+    // Read all entries from a file
+    struct Entry {
+        string index;
+        vector<int> values;
+    };
+
+    vector<Entry> read_all_entries(int file_index) {
+        vector<Entry> entries;
+        string filename = get_filename(file_index);
+
+        ifstream file(filename, ios::binary);
+        if (!file.is_open()) {
+            return entries;
+        }
+
+        while (file.peek() != EOF) {
+            Entry entry;
+            size_t key_len;
+            file.read(reinterpret_cast<char*>(&key_len), sizeof(key_len));
+            if (!file) break;
+
+            entry.index.resize(key_len);
+            file.read(&entry.index[0], key_len);
+            if (!file) break;
+
+            size_t value_count;
+            file.read(reinterpret_cast<char*>(&value_count), sizeof(value_count));
+            if (!file) break;
+
+            entry.values.resize(value_count);
+            for (size_t i = 0; i < value_count; ++i) {
+                file.read(reinterpret_cast<char*>(&entry.values[i]), sizeof(entry.values[i]));
+            }
+            if (!file) break;
+
+            entries.push_back(entry);
+        }
+
+        file.close();
+        return entries;
+    }
+
+    // Write all entries to a file
+    void write_all_entries(int file_index, const vector<Entry>& entries) {
+        string filename = get_filename(file_index);
+
+        ofstream file(filename, ios::binary);
+        if (!file.is_open()) {
+            return;
+        }
+
+        for (const auto& entry : entries) {
+            size_t key_len = entry.index.size();
+            file.write(reinterpret_cast<const char*>(&key_len), sizeof(key_len));
+            file.write(entry.index.c_str(), key_len);
+
+            size_t value_count = entry.values.size();
+            file.write(reinterpret_cast<const char*>(&value_count), sizeof(value_count));
+            for (int val : entry.values) {
+                file.write(reinterpret_cast<const char*>(&val), sizeof(val));
+            }
+        }
+
+        file.close();
     }
 
 public:
@@ -47,119 +105,86 @@ public:
 
     // Insert a key-value pair
     void insert(const string& index, int value) {
-        string filename = get_filename(index);
-        vector<int> values;
+        int file_index = get_file_index(index);
+        vector<Entry> entries = read_all_entries(file_index);
 
-        // Read existing values if file exists
-        if (file_exists(filename)) {
-            ifstream file(filename, ios::binary);
-            if (file.is_open()) {
-                int val;
-                while (file.read(reinterpret_cast<char*>(&val), sizeof(val))) {
-                    values.push_back(val);
+        // Find if the key already exists
+        bool found = false;
+        for (auto& entry : entries) {
+            if (entry.index == index) {
+                // Check if value already exists
+                for (int val : entry.values) {
+                    if (val == value) {
+                        return; // Already exists, don't insert
+                    }
                 }
-                file.close();
+                entry.values.push_back(value);
+                found = true;
+                break;
             }
         }
 
-        // Check if value already exists (no duplicates allowed)
-        for (int val : values) {
-            if (val == value) {
-                return; // Already exists, don't insert
-            }
+        if (!found) {
+            Entry new_entry;
+            new_entry.index = index;
+            new_entry.values.push_back(value);
+            entries.push_back(new_entry);
         }
 
-        // Add new value
-        values.push_back(value);
-
-        // Write all values back to file
-        ofstream file(filename, ios::binary);
-        if (file.is_open()) {
-            for (int val : values) {
-                file.write(reinterpret_cast<const char*>(&val), sizeof(val));
-            }
-            file.close();
-        }
+        write_all_entries(file_index, entries);
     }
 
     // Delete a key-value pair
     void delete_entry(const string& index, int value) {
-        string filename = get_filename(index);
+        int file_index = get_file_index(index);
+        vector<Entry> entries = read_all_entries(file_index);
 
-        if (!file_exists(filename)) {
-            return; // File doesn't exist, nothing to delete
-        }
-
-        vector<int> values;
-        bool found = false;
-
-        // Read existing values
-        ifstream file(filename, ios::binary);
-        if (file.is_open()) {
-            int val;
-            while (file.read(reinterpret_cast<char*>(&val), sizeof(val))) {
-                if (val == value) {
-                    found = true;
-                } else {
-                    values.push_back(val);
+        bool modified = false;
+        for (auto& entry : entries) {
+            if (entry.index == index) {
+                auto it = std::find(entry.values.begin(), entry.values.end(), value);
+                if (it != entry.values.end()) {
+                    entry.values.erase(it);
+                    modified = true;
                 }
+                break;
             }
-            file.close();
         }
 
-        if (!found) {
-            return; // Value not found, nothing to delete
-        }
+        if (modified) {
+            // Remove empty entries
+            entries.erase(remove_if(entries.begin(), entries.end(),
+                [](const Entry& e) { return e.values.empty(); }), entries.end());
 
-        // Write remaining values back or delete file if empty
-        if (values.empty()) {
-            remove(filename.c_str());
-        } else {
-            ofstream file(filename, ios::binary);
-            if (file.is_open()) {
-                for (int val : values) {
-                    file.write(reinterpret_cast<const char*>(&val), sizeof(val));
-                }
-                file.close();
-            }
+            write_all_entries(file_index, entries);
         }
     }
 
     // Find all values for a key
     void find(const string& index) {
-        string filename = get_filename(index);
+        int file_index = get_file_index(index);
+        vector<Entry> entries = read_all_entries(file_index);
 
-        if (!file_exists(filename)) {
-            cout << "null" << endl;
-            return;
-        }
+        for (const auto& entry : entries) {
+            if (entry.index == index) {
+                if (entry.values.empty()) {
+                    cout << "null" << endl;
+                    return;
+                }
 
-        vector<int> values;
+                vector<int> sorted_values = entry.values;
+                sort(sorted_values.begin(), sorted_values.end());
 
-        // Read all values
-        ifstream file(filename, ios::binary);
-        if (file.is_open()) {
-            int val;
-            while (file.read(reinterpret_cast<char*>(&val), sizeof(val))) {
-                values.push_back(val);
+                for (size_t i = 0; i < sorted_values.size(); ++i) {
+                    if (i > 0) cout << " ";
+                    cout << sorted_values[i];
+                }
+                cout << endl;
+                return;
             }
-            file.close();
         }
 
-        if (values.empty()) {
-            cout << "null" << endl;
-            return;
-        }
-
-        // Sort values in ascending order
-        sort(values.begin(), values.end());
-
-        // Output values
-        for (size_t i = 0; i < values.size(); ++i) {
-            if (i > 0) cout << " ";
-            cout << values[i];
-        }
-        cout << endl;
+        cout << "null" << endl;
     }
 };
 
