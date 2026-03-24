@@ -4,6 +4,7 @@
 #include <vector>
 #include <algorithm>
 #include <functional>
+#include <unordered_map>
 #include <cstring>
 #include <sys/stat.h>
 
@@ -13,6 +14,8 @@ class FileStorage {
 private:
     string storage_dir;
     static const int NUM_FILES = 10;
+    static const int COMPACTION_THRESHOLD = 1000;
+    int op_count;
 
     string get_filename(int file_index) {
         return storage_dir + "/storage_" + to_string(file_index) + ".dat";
@@ -24,9 +27,80 @@ private:
         return hash_value % NUM_FILES;
     }
 
+    // Compact a single file
+    void compact_file(int file_index) {
+        string filename = get_filename(file_index);
+
+        // Read all entries and compute current state
+        unordered_map<string, vector<int>> current_state;
+
+        ifstream file(filename, ios::binary);
+        if (file.is_open()) {
+            while (file.peek() != EOF) {
+                char op_type;
+                file.read(&op_type, sizeof(op_type));
+                if (!file) break;
+
+                string key;
+                size_t key_len;
+                file.read(reinterpret_cast<char*>(&key_len), sizeof(key_len));
+                if (!file) break;
+
+                key.resize(key_len);
+                file.read(&key[0], key_len);
+                if (!file) break;
+
+                int value;
+                file.read(reinterpret_cast<char*>(&value), sizeof(value));
+                if (!file) break;
+
+                if (op_type == 'I') {
+                    // Check if value already exists
+                    bool exists = false;
+                    for (int v : current_state[key]) {
+                        if (v == value) {
+                            exists = true;
+                            break;
+                        }
+                    }
+                    if (!exists) {
+                        current_state[key].push_back(value);
+                    }
+                } else if (op_type == 'D') {
+                    // Remove value
+                    auto it = std::find(current_state[key].begin(), current_state[key].end(), value);
+                    if (it != current_state[key].end()) {
+                        current_state[key].erase(it);
+                    }
+                }
+            }
+            file.close();
+        }
+
+        // Write compacted state
+        ofstream outfile(filename, ios::binary);
+        if (outfile.is_open()) {
+            for (const auto& entry : current_state) {
+                if (!entry.second.empty()) {
+                    for (int value : entry.second) {
+                        outfile.write("I", 1);
+
+                        size_t key_len = entry.first.size();
+                        outfile.write(reinterpret_cast<const char*>(&key_len), sizeof(key_len));
+                        outfile.write(entry.first.c_str(), key_len);
+
+                        outfile.write(reinterpret_cast<const char*>(&value), sizeof(value));
+                    }
+                }
+            }
+            outfile.close();
+        }
+    }
+
 public:
     FileStorage() {
         storage_dir = "storage";
+        op_count = 0;
         struct stat st;
         memset(&st, 0, sizeof(st));
         if (stat(storage_dir.c_str(), &st) == -1) {
@@ -53,11 +127,27 @@ public:
     void insert(const string& index, int value) {
         int file_index = get_file_index(index);
         append_op(file_index, 'I', index, value);
+
+        op_count++;
+        if (op_count >= COMPACTION_THRESHOLD) {
+            for (int i = 0; i < NUM_FILES; ++i) {
+                compact_file(i);
+            }
+            op_count = 0;
+        }
     }
 
     void delete_entry(const string& index, int value) {
         int file_index = get_file_index(index);
         append_op(file_index, 'D', index, value);
+
+        op_count++;
+        if (op_count >= COMPACTION_THRESHOLD) {
+            for (int i = 0; i < NUM_FILES; ++i) {
+                compact_file(i);
+            }
+            op_count = 0;
+        }
     }
 
     void find(const string& index) {
