@@ -6,6 +6,8 @@
 #include <functional>
 #include <cstring>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 using namespace std;
 
@@ -13,89 +15,32 @@ class FileStorage {
 private:
     string storage_dir;
     static const int NUM_FILES = 10;
+    static const int BLOCK_SIZE = 4096;
+    static const int MAX_ENTRIES_PER_BLOCK = 50;
 
-    // Hash function to determine which file to use
+    string get_filename(int file_index) {
+        return storage_dir + "/storage_" + to_string(file_index) + ".dat";
+    }
+
     int get_file_index(const string& index) {
         hash<string> hasher;
         size_t hash_value = hasher(index);
         return hash_value % NUM_FILES;
     }
 
-    // Get filename for a given file index
-    string get_filename(int file_index) {
-        return storage_dir + "/storage_" + to_string(file_index) + ".dat";
-    }
+    struct BlockHeader {
+        int next_block;
+        int entry_count;
+    };
 
-    // Read all entries from a file
     struct Entry {
         string index;
         vector<int> values;
     };
 
-    vector<Entry> read_all_entries(int file_index) {
-        vector<Entry> entries;
-        string filename = get_filename(file_index);
-
-        ifstream file(filename, ios::binary);
-        if (!file.is_open()) {
-            return entries;
-        }
-
-        while (file.peek() != EOF) {
-            Entry entry;
-            size_t key_len;
-            file.read(reinterpret_cast<char*>(&key_len), sizeof(key_len));
-            if (!file) break;
-
-            entry.index.resize(key_len);
-            file.read(&entry.index[0], key_len);
-            if (!file) break;
-
-            size_t value_count;
-            file.read(reinterpret_cast<char*>(&value_count), sizeof(value_count));
-            if (!file) break;
-
-            entry.values.resize(value_count);
-            for (size_t i = 0; i < value_count; ++i) {
-                file.read(reinterpret_cast<char*>(&entry.values[i]), sizeof(entry.values[i]));
-            }
-            if (!file) break;
-
-            entries.push_back(entry);
-        }
-
-        file.close();
-        return entries;
-    }
-
-    // Write all entries to a file
-    void write_all_entries(int file_index, const vector<Entry>& entries) {
-        string filename = get_filename(file_index);
-
-        ofstream file(filename, ios::binary);
-        if (!file.is_open()) {
-            return;
-        }
-
-        for (const auto& entry : entries) {
-            size_t key_len = entry.index.size();
-            file.write(reinterpret_cast<const char*>(&key_len), sizeof(key_len));
-            file.write(entry.index.c_str(), key_len);
-
-            size_t value_count = entry.values.size();
-            file.write(reinterpret_cast<const char*>(&value_count), sizeof(value_count));
-            for (int val : entry.values) {
-                file.write(reinterpret_cast<const char*>(&val), sizeof(val));
-            }
-        }
-
-        file.close();
-    }
-
 public:
     FileStorage() {
         storage_dir = "storage";
-        // Create storage directory if it doesn't exist
         struct stat st;
         memset(&st, 0, sizeof(st));
         if (stat(storage_dir.c_str(), &st) == -1) {
@@ -103,19 +48,60 @@ public:
         }
     }
 
-    // Insert a key-value pair
     void insert(const string& index, int value) {
         int file_index = get_file_index(index);
-        vector<Entry> entries = read_all_entries(file_index);
+        string filename = get_filename(file_index);
 
-        // Find if the key already exists
+        vector<Entry> all_entries;
+
+        // Read all entries from file
+        fstream file(filename, ios::binary | ios::in | ios::out);
+        if (file.is_open()) {
+            while (file.peek() != EOF) {
+                BlockHeader header;
+                file.read(reinterpret_cast<char*>(&header), sizeof(header));
+                if (!file) break;
+
+                for (int i = 0; i < header.entry_count; ++i) {
+                    Entry entry;
+                    size_t key_len;
+                    file.read(reinterpret_cast<char*>(&key_len), sizeof(key_len));
+                    if (!file) break;
+
+                    entry.index.resize(key_len);
+                    file.read(&entry.index[0], key_len);
+                    if (!file) break;
+
+                    size_t value_count;
+                    file.read(reinterpret_cast<char*>(&value_count), sizeof(value_count));
+                    if (!file) break;
+
+                    entry.values.resize(value_count);
+                    for (size_t j = 0; j < value_count; ++j) {
+                        file.read(reinterpret_cast<char*>(&entry.values[j]), sizeof(entry.values[j]));
+                    }
+                    if (!file) break;
+
+                    all_entries.push_back(entry);
+                }
+
+                // Skip to next block
+                if (header.next_block != -1) {
+                    file.seekg(header.next_block);
+                } else {
+                    break;
+                }
+            }
+            file.close();
+        }
+
+        // Find and update the entry
         bool found = false;
-        for (auto& entry : entries) {
+        for (auto& entry : all_entries) {
             if (entry.index == index) {
-                // Check if value already exists
                 for (int val : entry.values) {
                     if (val == value) {
-                        return; // Already exists, don't insert
+                        return; // Already exists
                     }
                 }
                 entry.values.push_back(value);
@@ -128,19 +114,110 @@ public:
             Entry new_entry;
             new_entry.index = index;
             new_entry.values.push_back(value);
-            entries.push_back(new_entry);
+            all_entries.push_back(new_entry);
         }
 
-        write_all_entries(file_index, entries);
+        // Write all entries back to file
+        ofstream outfile(filename, ios::binary);
+        if (outfile.is_open()) {
+            int current_block = 0;
+            size_t entry_idx = 0;
+
+            while (entry_idx < all_entries.size()) {
+                BlockHeader header;
+                header.next_block = -1;
+                header.entry_count = 0;
+
+                int header_pos = current_block;
+                outfile.seekp(header_pos);
+                outfile.write(reinterpret_cast<const char*>(&header), sizeof(header));
+
+                int data_pos = current_block + sizeof(header);
+
+                while (entry_idx < all_entries.size() && header.entry_count < MAX_ENTRIES_PER_BLOCK) {
+                    const Entry& entry = all_entries[entry_idx];
+                    size_t key_len = entry.index.size();
+                    size_t value_count = entry.values.size();
+
+                    outfile.seekp(data_pos);
+                    outfile.write(reinterpret_cast<const char*>(&key_len), sizeof(key_len));
+                    outfile.write(entry.index.c_str(), key_len);
+                    outfile.write(reinterpret_cast<const char*>(&value_count), sizeof(value_count));
+                    for (int val : entry.values) {
+                        outfile.write(reinterpret_cast<const char*>(&val), sizeof(val));
+                    }
+
+                    data_pos += sizeof(key_len) + key_len + sizeof(value_count) + value_count * sizeof(int);
+                    header.entry_count++;
+                    entry_idx++;
+                }
+
+                // Update header
+                outfile.seekp(header_pos);
+                outfile.write(reinterpret_cast<const char*>(&header), sizeof(header));
+
+                // Prepare for next block
+                if (entry_idx < all_entries.size()) {
+                    current_block += BLOCK_SIZE;
+                    header.next_block = current_block;
+                    outfile.seekp(header_pos);
+                    outfile.write(reinterpret_cast<const char*>(&header), sizeof(header));
+                }
+            }
+
+            outfile.close();
+        }
     }
 
-    // Delete a key-value pair
     void delete_entry(const string& index, int value) {
         int file_index = get_file_index(index);
-        vector<Entry> entries = read_all_entries(file_index);
+        string filename = get_filename(file_index);
 
+        vector<Entry> all_entries;
+
+        // Read all entries from file
+        fstream file(filename, ios::binary | ios::in | ios::out);
+        if (file.is_open()) {
+            while (file.peek() != EOF) {
+                BlockHeader header;
+                file.read(reinterpret_cast<char*>(&header), sizeof(header));
+                if (!file) break;
+
+                for (int i = 0; i < header.entry_count; ++i) {
+                    Entry entry;
+                    size_t key_len;
+                    file.read(reinterpret_cast<char*>(&key_len), sizeof(key_len));
+                    if (!file) break;
+
+                    entry.index.resize(key_len);
+                    file.read(&entry.index[0], key_len);
+                    if (!file) break;
+
+                    size_t value_count;
+                    file.read(reinterpret_cast<char*>(&value_count), sizeof(value_count));
+                    if (!file) break;
+
+                    entry.values.resize(value_count);
+                    for (size_t j = 0; j < value_count; ++j) {
+                        file.read(reinterpret_cast<char*>(&entry.values[j]), sizeof(entry.values[j]));
+                    }
+                    if (!file) break;
+
+                    all_entries.push_back(entry);
+                }
+
+                if (header.next_block != -1) {
+                    file.seekg(header.next_block);
+                } else {
+                    break;
+                }
+            }
+            file.close();
+        }
+
+        // Find and delete the value
         bool modified = false;
-        for (auto& entry : entries) {
+        for (auto& entry : all_entries) {
             if (entry.index == index) {
                 auto it = std::find(entry.values.begin(), entry.values.end(), value);
                 if (it != entry.values.end()) {
@@ -153,38 +230,122 @@ public:
 
         if (modified) {
             // Remove empty entries
-            entries.erase(remove_if(entries.begin(), entries.end(),
-                [](const Entry& e) { return e.values.empty(); }), entries.end());
+            all_entries.erase(remove_if(all_entries.begin(), all_entries.end(),
+                [](const Entry& e) { return e.values.empty(); }), all_entries.end());
 
-            write_all_entries(file_index, entries);
+            // Write all entries back to file
+            ofstream outfile(filename, ios::binary);
+            if (outfile.is_open()) {
+                int current_block = 0;
+                size_t entry_idx = 0;
+
+                while (entry_idx < all_entries.size()) {
+                    BlockHeader header;
+                    header.next_block = -1;
+                    header.entry_count = 0;
+
+                    int header_pos = current_block;
+                    outfile.seekp(header_pos);
+                    outfile.write(reinterpret_cast<const char*>(&header), sizeof(header));
+
+                    int data_pos = current_block + sizeof(header);
+
+                    while (entry_idx < all_entries.size() && header.entry_count < MAX_ENTRIES_PER_BLOCK) {
+                        const Entry& entry = all_entries[entry_idx];
+                        size_t key_len = entry.index.size();
+                        size_t value_count = entry.values.size();
+
+                        outfile.seekp(data_pos);
+                        outfile.write(reinterpret_cast<const char*>(&key_len), sizeof(key_len));
+                        outfile.write(entry.index.c_str(), key_len);
+                        outfile.write(reinterpret_cast<const char*>(&value_count), sizeof(value_count));
+                        for (int val : entry.values) {
+                            outfile.write(reinterpret_cast<const char*>(&val), sizeof(val));
+                        }
+
+                        data_pos += sizeof(key_len) + key_len + sizeof(value_count) + value_count * sizeof(int);
+                        header.entry_count++;
+                        entry_idx++;
+                    }
+
+                    outfile.seekp(header_pos);
+                    outfile.write(reinterpret_cast<const char*>(&header), sizeof(header));
+
+                    if (entry_idx < all_entries.size()) {
+                        current_block += BLOCK_SIZE;
+                        header.next_block = current_block;
+                        outfile.seekp(header_pos);
+                        outfile.write(reinterpret_cast<const char*>(&header), sizeof(header));
+                    }
+                }
+
+                outfile.close();
+            }
         }
     }
 
-    // Find all values for a key
     void find(const string& index) {
         int file_index = get_file_index(index);
-        vector<Entry> entries = read_all_entries(file_index);
+        string filename = get_filename(file_index);
 
-        for (const auto& entry : entries) {
-            if (entry.index == index) {
-                if (entry.values.empty()) {
-                    cout << "null" << endl;
-                    return;
+        vector<int> values;
+
+        fstream file(filename, ios::binary | ios::in);
+        if (file.is_open()) {
+            while (file.peek() != EOF) {
+                BlockHeader header;
+                file.read(reinterpret_cast<char*>(&header), sizeof(header));
+                if (!file) break;
+
+                for (int i = 0; i < header.entry_count; ++i) {
+                    string key;
+                    size_t key_len;
+                    file.read(reinterpret_cast<char*>(&key_len), sizeof(key_len));
+                    if (!file) break;
+
+                    key.resize(key_len);
+                    file.read(&key[0], key_len);
+                    if (!file) break;
+
+                    size_t value_count;
+                    file.read(reinterpret_cast<char*>(&value_count), sizeof(value_count));
+                    if (!file) break;
+
+                    if (key == index) {
+                        values.resize(value_count);
+                        for (size_t j = 0; j < value_count; ++j) {
+                            file.read(reinterpret_cast<char*>(&values[j]), sizeof(values[j]));
+                        }
+                    } else {
+                        // Skip values
+                        int val;
+                        for (size_t j = 0; j < value_count; ++j) {
+                            file.read(reinterpret_cast<char*>(&val), sizeof(val));
+                        }
+                    }
                 }
 
-                vector<int> sorted_values = entry.values;
-                sort(sorted_values.begin(), sorted_values.end());
-
-                for (size_t i = 0; i < sorted_values.size(); ++i) {
-                    if (i > 0) cout << " ";
-                    cout << sorted_values[i];
+                if (header.next_block != -1) {
+                    file.seekg(header.next_block);
+                } else {
+                    break;
                 }
-                cout << endl;
-                return;
             }
+            file.close();
         }
 
-        cout << "null" << endl;
+        if (values.empty()) {
+            cout << "null" << endl;
+            return;
+        }
+
+        sort(values.begin(), values.end());
+
+        for (size_t i = 0; i < values.size(); ++i) {
+            if (i > 0) cout << " ";
+            cout << values[i];
+        }
+        cout << endl;
     }
 };
 
